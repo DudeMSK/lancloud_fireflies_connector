@@ -80,10 +80,25 @@ FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 JOIN_LEAD_MINUTES = 1
 # Как часто опрашивать календарь, секунды
 POLL_INTERVAL_SECONDS = 60
+
+# Пост-проверка, что бот реально подключился и записал встречу: сколько минут
+# ждать после ОКОНЧАНИЯ встречи, прежде чем первый раз спросить Fireflies API,
+# появился ли транскрипт (сразу после конца записи транскрипт ещё не готов).
+VERIFY_DELAY_MINUTES = int(os.environ.get("VERIFY_DELAY_MINUTES", "5"))
+# Сколько раз повторить проверку, если транскрипт ещё не найден
+VERIFY_MAX_ATTEMPTS = int(os.environ.get("VERIFY_MAX_ATTEMPTS", "3"))
+# Интервал между повторными проверками, минут
+VERIFY_RETRY_MINUTES = int(os.environ.get("VERIFY_RETRY_MINUTES", "5"))
 # Файл, куда сохраняются ID уже отправленных встреч, чтобы не дублировать запросы
 STATE_FILE = Path(__file__).with_name("processed_meetings.json")
 
-TEAMS_LINK_PATTERN = re.compile(r"https://teams\.microsoft\.com/l/meetup-join/[^\s\"'<>]+")
+# Покрывает и корпоративный Teams (Microsoft 365: teams.microsoft.com/l/meetup-join/...),
+# и личный/бесплатный Teams (teams.live.com/meet/...) — в реальных встречах LanCloud
+# ссылки оказались именно во втором формате, старый regex их не находил вообще.
+TEAMS_LINK_PATTERN = re.compile(
+    r"https://teams\.microsoft\.com/l/meetup-join/[^\s\"'<>]+"
+    r"|https://teams\.live\.com/meet/[^\s\"'<>]+"
+)
 
 ROOM_NAME_PATTERN = re.compile(r"Групп\s+(\S+)\s*\(")
 
@@ -203,7 +218,90 @@ def send_to_fireflies(meeting_link: str, title: str, duration_minutes: int = 60)
     return False
 
 
-def check_calendar_and_dispatch(account: Account, processed_ids: set) -> None:
+def check_transcript_recorded(meeting_link: str, title: str, from_date: datetime, to_date: datetime) -> bool:
+    """Спрашиваем Fireflies API, появился ли транскрипт для этой встречи —
+    это единственный способ узнать, что бот реально подключился и записал
+    звонок, а не просто что запрос addToLiveMeeting был принят.
+    """
+    query = """
+    query Transcripts($fromDate: DateTime, $toDate: DateTime, $limit: Int) {
+      transcripts(fromDate: $fromDate, toDate: $toDate, limit: $limit) {
+        id
+        title
+        meeting_link
+      }
+    }
+    """
+    variables = {
+        "fromDate": from_date.isoformat(),
+        "toDate": to_date.isoformat(),
+        "limit": 50,
+    }
+    headers = {
+        "Authorization": f"Bearer {FIREFLIES_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            FIREFLIES_GRAPHQL_URL,
+            json={"query": query, "variables": variables},
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Ошибка запроса транскриптов Fireflies API: %s", e)
+        return False
+
+    data = resp.json()
+    if data.get("errors"):
+        log.error("Fireflies API вернул ошибку при проверке транскрипта '%s': %s", title, data["errors"])
+        return False
+
+    transcripts = data.get("data", {}).get("transcripts") or []
+    return any(t.get("meeting_link") == meeting_link or t.get("title") == title for t in transcripts)
+
+
+def process_pending_verifications(pending: list, tz) -> None:
+    """Проходит по очереди отправленных встреч и проверяет, появился ли
+    транскрипт (значит бот реально подключился). Не найден — повторяем
+    попытку позже, после VERIFY_MAX_ATTEMPTS — сдаёмся и пишем warning."""
+    if not pending:
+        return
+
+    now = datetime.now(tz)
+    still_pending = []
+    for item in pending:
+        if now < item["next_check"]:
+            still_pending.append(item)
+            continue
+
+        found = check_transcript_recorded(
+            item["link"],
+            item["title"],
+            item["start"] - timedelta(minutes=5),
+            item["end"] + timedelta(minutes=VERIFY_DELAY_MINUTES + VERIFY_RETRY_MINUTES * VERIFY_MAX_ATTEMPTS + 5),
+        )
+        if found:
+            log.info("Подтверждено: бот Fireflies подключился и записал встречу '%s'.", item["title"])
+            continue
+
+        item["attempts"] += 1
+        if item["attempts"] >= VERIFY_MAX_ATTEMPTS:
+            log.warning(
+                "НЕ ПОДТВЕРЖДЕНО подключение бота к встрече '%s' — транскрипт не найден после %d "
+                "попыток. Проверьте вручную (возможно, зал ожидания Teams или лимит запросов Fireflies).",
+                item["title"], item["attempts"],
+            )
+            continue
+
+        item["next_check"] = now + timedelta(minutes=VERIFY_RETRY_MINUTES)
+        still_pending.append(item)
+
+    pending[:] = still_pending
+
+
+def check_calendar_and_dispatch(account: Account, processed_ids: set, pending_verifications: list) -> None:
     tz = EWSTimeZone(TZ_NAME) if TZ_NAME else EWSTimeZone.localzone()
     now = datetime.now(tz)
     window_end = now + timedelta(minutes=JOIN_LEAD_MINUTES + POLL_INTERVAL_SECONDS / 60 + 2)
@@ -241,6 +339,14 @@ def check_calendar_and_dispatch(account: Account, processed_ids: set) -> None:
         if send_to_fireflies(link, title, duration):
             processed_ids.add(event_id)
             save_state(processed_ids)
+            pending_verifications.append({
+                "title": title,
+                "link": link,
+                "start": event.start,
+                "end": event.end,
+                "next_check": event.end + timedelta(minutes=VERIFY_DELAY_MINUTES),
+                "attempts": 0,
+            })
 
 
 def main() -> None:
@@ -249,10 +355,13 @@ def main() -> None:
     log.info("Подключено. Мониторинг календаря запущен (опрос каждые %sс).", POLL_INTERVAL_SECONDS)
 
     processed_ids = load_state()
+    pending_verifications: list = []
+    tz = EWSTimeZone(TZ_NAME) if TZ_NAME else EWSTimeZone.localzone()
 
     while True:
         try:
-            check_calendar_and_dispatch(account, processed_ids)
+            check_calendar_and_dispatch(account, processed_ids, pending_verifications)
+            process_pending_verifications(pending_verifications, tz)
         except UnauthorizedError:
             log.error("Ошибка авторизации в Exchange — проверьте логин/пароль/сервер.")
         except ErrorNonExistentMailbox:
