@@ -36,10 +36,10 @@ pip install -r requirements.txt
    ```
 2. Заполните `.env` своими данными:
    ```
-   EWS_EMAIL=arthur@company.ru
-   EWS_USERNAME=arthur@company.ru
+   EWS_EMAIL=example@company.ru
+   EWS_USERNAME=example@company.ru
    EWS_PASSWORD=ваш_пароль
-   EWS_SERVER=mail.lancloud.ru
+   EWS_SERVER=mail.example.ru
    FIREFLIES_API_KEY=ваш_ключ_fireflies
    ```
 3. **Не коммитьте `.env` в git** — он уже в `.gitignore`, но перепроверьте перед публикацией.
@@ -71,8 +71,7 @@ lancloud-fireflies-bridge/
 ## Автозапуск (опционально)
 
 Чтобы скрипт работал постоянно в фоне:
-
 - **Windows**: создать задачу в Планировщике заданий (Task Scheduler), запуск при входе в систему.
 - **Linux/macOS**: обернуть в systemd unit / launchd job, либо запускать через `nohup`/`screen`/`tmux`.
 
-Если понадобится — могу собрать конфиг для конкретного варианта автозапуска.
+## Серис в разработке, будет дорабатываться
