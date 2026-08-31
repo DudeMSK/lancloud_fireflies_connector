@@ -36,10 +36,10 @@ pip install -r requirements.txt
    ```
 2. Заполните `.env` своими данными:
    ```
-   EWS_EMAIL=arthur@company.ru
-   EWS_USERNAME=arthur@company.ru
+   EWS_EMAIL=example@company.ru
+   EWS_USERNAME=example@company.ru
    EWS_PASSWORD=ваш_пароль
-   EWS_SERVER=mail.lancloud.ru
+   EWS_SERVER=mail.example.ru
    FIREFLIES_API_KEY=ваш_ключ_fireflies
    ```
 3. **Не коммитьте `.env` в git** — он уже в `.gitignore`, но перепроверьте перед публикацией.
@@ -53,9 +53,16 @@ python3 lancloud_fireflies_bridge.py
 Скрипт:
 - подключается к Exchange (сначала пробует autodiscover, при неудаче — явный `EWS_SERVER`);
 - каждые 60 секунд опрашивает календарь на ближайшие встречи;
-- ищет ссылку `teams.microsoft.com/l/meetup-join/...` в месте или теле встречи;
+- ищет ссылку `teams.microsoft.com/l/meetup-join/...` (корпоративный Teams) или
+  `teams.live.com/meet/...` (личный/бесплатный Teams) в месте или теле встречи;
 - за 1 минуту до начала отправляет её в Fireflies;
-- запоминает уже обработанные встречи в `processed_meetings.json`, чтобы не дублировать запросы.
+- запоминает уже обработанные встречи в `processed_meetings.json`, чтобы не дублировать запросы;
+- через `VERIFY_DELAY_MINUTES` (по умолчанию 5) минут после окончания встречи спрашивает
+  Fireflies API, появился ли транскрипт — это подтверждает, что бот реально подключился
+  к звонку, а не просто что запрос был принят. Если транскрипт не найден, повторяет
+  проверку ещё `VERIFY_MAX_ATTEMPTS` раз (по умолчанию 3) с интервалом `VERIFY_RETRY_MINUTES`
+  (по умолчанию 5) минут, а затем пишет в лог WARNING, если бот так и не подключился
+  (например, из-за зала ожидания Teams).
 
 ## Структура проекта
 
@@ -71,8 +78,7 @@ lancloud-fireflies-bridge/
 ## Автозапуск (опционально)
 
 Чтобы скрипт работал постоянно в фоне:
-
 - **Windows**: создать задачу в Планировщике заданий (Task Scheduler), запуск при входе в систему.
 - **Linux/macOS**: обернуть в systemd unit / launchd job, либо запускать через `nohup`/`screen`/`tmux`.
 
-Если понадобится — могу собрать конфиг для конкретного варианта автозапуска.
+## Серис в разработке, будет дорабатываться
