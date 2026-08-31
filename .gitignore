@@ -1,0 +1,4 @@
+.env
+processed_meetings.json
+__pycache__/
+*.pyc
