@@ -81,4 +81,5 @@ lancloud-fireflies-bridge/
 - **Windows**: создать задачу в Планировщике заданий (Task Scheduler), запуск при входе в систему.
 - **Linux/macOS**: обернуть в systemd unit / launchd job, либо запускать через `nohup`/`screen`/`tmux`.
 
-## Серис в разработке, будет дорабатываться
+Готовая инструкция для развёртывания на Linux-сервере как systemd-службы (с
+установочным скриптом и unit-файлом) — см. [DEPLOYMENT.md](DEPLOYMENT.md).

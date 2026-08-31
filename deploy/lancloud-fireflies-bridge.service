@@ -1,0 +1,27 @@
+[Unit]
+Description=LanCloud Exchange -> Fireflies bridge (auto-join bot to Teams meetings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fireflies-bridge
+Group=fireflies-bridge
+WorkingDirectory=/opt/lancloud-fireflies-bridge
+ExecStart=/opt/lancloud-fireflies-bridge/venv/bin/python3 /opt/lancloud-fireflies-bridge/lancloud_fireflies_bridge.py
+Restart=always
+RestartSec=10
+# Логи скрипт пишет через logging в stdout/stderr — journald подхватывает их
+# автоматически, отдельный лог-файл не нужен (смотреть: journalctl -u lancloud-fireflies-bridge -f).
+StandardOutput=journal
+StandardError=journal
+
+# Базовая изоляция: сервису не нужно ничего, кроме своей рабочей папки и сети.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/lancloud-fireflies-bridge
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

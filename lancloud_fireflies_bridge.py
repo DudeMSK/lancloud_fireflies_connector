@@ -43,13 +43,19 @@ import re
 import time
 import json
 import logging
+import warnings
 from datetime import timedelta, datetime
 from pathlib import Path
 from typing import Optional
 
 import requests
 from exchangelib import Credentials, Account, Configuration, DELEGATE, EWSTimeZone, BASIC
-from exchangelib.errors import UnauthorizedError, ErrorNonExistentMailbox
+from exchangelib.errors import (
+    UnauthorizedError,
+    ErrorNonExistentMailbox,
+    ErrorAccessDenied,
+    ErrorFolderNotFound,
+)
 
 try:
     from dotenv import load_dotenv
@@ -75,6 +81,15 @@ TZ_NAME = os.environ.get("TZ", "")
 
 FIREFLIES_API_KEY = os.environ.get("FIREFLIES_API_KEY", "")
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
+
+# Чужие ящики, чьи календари опрашиваем помимо своего (EWS_EMAIL). Доступ к ним
+# уже выдан на уровне Exchange той же учётке secretary (delegate/reviewer — то же,
+# что видно в Outlook), отдельный логин под каждый не нужен.
+OTHER_CALENDAR_MAILBOXES = {
+    "vedeneeva.n@enremservice.ru": "Веденеева Надежда",
+    "victor@enremservice.ru": "Колесников Виктор",
+    "info@enremservice.ru": "Отдел коммуникаций ЭРС",
+}
 
 # За сколько минут до начала встречи отправлять бота (0 = ровно в момент начала)
 JOIN_LEAD_MINUTES = 1
@@ -105,6 +120,18 @@ ROOM_NAME_PATTERN = re.compile(r"Групп\s+(\S+)\s*\(")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lancloud-fireflies-bridge")
 
+# Приглушаем шум самой exchangelib, не относящийся к нашей логике:
+# - INFO-строки "Found naive datetime ... Assuming timezone" на служебных полях
+#   (например last_modified_time) отдельных событий — не время встречи, безобидно.
+# - UserWarning про нестандартные ("Customized Time Zone") часовые пояса, которые
+#   иногда ставит Outlook — библиотека и так корректно откатывается на разумное значение.
+logging.getLogger("exchangelib").setLevel(logging.WARNING)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Cannot convert value .* to type 'EWSTimeZone'",
+    category=UserWarning,
+)
+
 
 def load_state() -> set:
     if STATE_FILE.exists():
@@ -119,7 +146,11 @@ def save_state(processed_ids: set) -> None:
     STATE_FILE.write_text(json.dumps(sorted(processed_ids)))
 
 
-def connect_account() -> Account:
+def connect_and_verify() -> Configuration:
+    """Проверяет, что учётка EWS_USERNAME может подключиться к Exchange
+    (через собственный ящик EWS_EMAIL), и возвращает Configuration для
+    дальнейшего построения Account на любой другой ящик той же учёткой.
+    """
     if not all([EWS_EMAIL, EWS_USERNAME, EWS_PASSWORD, EWS_SERVER]):
         raise RuntimeError(
             "Не заданы переменные окружения EWS_EMAIL / EWS_USERNAME / "
@@ -143,12 +174,31 @@ def connect_account() -> Account:
         # в середине основного цикла.
         _ = account.root
         log.info("Подключение успешно.")
-        return account
+        return config
     except Exception as e:
         raise RuntimeError(
             f"Не удалось подключиться к Exchange ('{EWS_SERVER}', логин '{EWS_USERNAME}', "
             f"BASIC). Проверьте EWS_USERNAME/EWS_PASSWORD в .env. Ошибка: {e}"
         ) from e
+
+
+def build_calendar_accounts(config: Configuration) -> list:
+    """Собирает список (label, Account) для всех календарей, которые нужно
+    опрашивать: свой (EWS_EMAIL) + чужие из OTHER_CALENDAR_MAILBOXES. Доступ к
+    чужим ящикам не требует отдельного логина — используется та же учётка,
+    что и для своего ящика (см. модуль-докстринг, права уже выданы в Exchange).
+    """
+    mailboxes = [(EWS_EMAIL, "Секретарь")] + list(OTHER_CALENDAR_MAILBOXES.items())
+    accounts = []
+    for smtp_address, label in mailboxes:
+        account = Account(
+            primary_smtp_address=smtp_address,
+            config=config,
+            autodiscover=False,
+            access_type=DELEGATE,
+        )
+        accounts.append((label, account))
+    return accounts
 
 
 def extract_teams_link(event) -> Optional[str]:
@@ -176,7 +226,7 @@ def extract_room_name(event) -> Optional[str]:
 
 def send_to_fireflies(meeting_link: str, title: str, duration_minutes: int = 60) -> bool:
     query = """
-    mutation AddToLiveMeeting($meeting_link: String, $title: String, $duration: Int) {
+    mutation AddToLiveMeeting($meeting_link: String!, $title: String, $duration: Int) {
       addToLiveMeeting(meeting_link: $meeting_link, title: $title, duration: $duration) {
         success
         message
@@ -201,7 +251,8 @@ def send_to_fireflies(meeting_link: str, title: str, duration_minutes: int = 60)
         )
         resp.raise_for_status()
     except requests.RequestException as e:
-        log.error("Ошибка запроса к Fireflies API: %s", e)
+        body = getattr(e.response, "text", "")
+        log.error("Ошибка запроса к Fireflies API: %s%s", e, f" | Ответ: {body}" if body else "")
         return False
 
     data = resp.json()
@@ -301,31 +352,54 @@ def process_pending_verifications(pending: list, tz) -> None:
     pending[:] = still_pending
 
 
-def check_calendar_and_dispatch(account: Account, processed_ids: set, pending_verifications: list) -> None:
+def check_calendar_and_dispatch(calendar_accounts: list, processed_ids: set, pending_verifications: list) -> None:
     tz = EWSTimeZone(TZ_NAME) if TZ_NAME else EWSTimeZone.localzone()
     now = datetime.now(tz)
     window_end = now + timedelta(minutes=JOIN_LEAD_MINUTES + POLL_INTERVAL_SECONDS / 60 + 2)
 
-    items = list(account.calendar.view(start=now - timedelta(minutes=2), end=window_end))
-    log.info("Итерация: сейчас %s, найдено встреч в окне: %d", now.strftime("%d.%m %H:%M:%S"), len(items))
+    # Фаза 1: собираем события со всех календарей и сразу схлопываем дубликаты.
+    # Одна и та же встреча обычно лежит копией сразу в нескольких из опрашиваемых
+    # календарей (организатор + участники) — у каждой копии свой event.id, но
+    # одинаковые ссылка на Teams и время начала. Ключ дедупа — (ссылка, начало),
+    # первая найденная копия побеждает, остальные календари для неё больше не
+    # смотрим и не обрабатываем.
+    unique_meetings = {}  # meeting_key -> (event, label, link)
+    total_events = 0
+    for label, account in calendar_accounts:
+        try:
+            items = list(account.calendar.view(start=now - timedelta(minutes=2), end=window_end))
+        except (UnauthorizedError, ErrorAccessDenied, ErrorFolderNotFound, ErrorNonExistentMailbox) as e:
+            log.warning("  [%s] нет доступа к календарю — пропускаем этот ящик: %s", label, e)
+            continue
 
-    for event in items:
-        event_id = str(event.id)
+        total_events += len(items)
+        for event in items:
+            link = extract_teams_link(event)
+            if not link:
+                continue
+            meeting_key = f"{link}::{event.start.isoformat()}"
+            unique_meetings.setdefault(meeting_key, (event, label, link))
+
+    log.info(
+        "Итерация: сейчас %s, событий в %d календарях: %d, из них уникальных встреч с Teams-ссылкой: %d",
+        now.strftime("%d.%m %H:%M:%S"), len(calendar_accounts), total_events, len(unique_meetings),
+    )
+
+    # Фаза 2: каждую уникальную встречу обрабатываем и отправляем ровно один раз.
+    for meeting_key, (event, label, link) in unique_meetings.items():
         local_start = event.start.astimezone(tz)
         subject = event.subject or "(без названия)"
 
-        if event_id in processed_ids:
-            log.info("  [%s в %s] уже отправлена ранее — пропуск", subject, local_start.strftime("%H:%M"))
+        if meeting_key in processed_ids:
+            # DEBUG, а не INFO: иначе эта строка повторялась бы на каждом опросе
+            # (раз в минуту) вплоть до конца встречи и выглядела бы как будто
+            # что-то зависло. Реальное подтверждение входа бота — отдельные
+            # строки "Подтверждено: бот Fireflies подключился..." из process_pending_verifications.
+            log.debug("  [%s в %s] уже отправлена ранее — пропуск", subject, local_start.strftime("%H:%M"))
             continue
 
-        start = event.start
-        if start - timedelta(minutes=JOIN_LEAD_MINUTES) > now:
+        if event.start - timedelta(minutes=JOIN_LEAD_MINUTES) > now:
             log.info("  [%s в %s] ещё рано — пропуск", subject, local_start.strftime("%H:%M"))
-            continue
-
-        link = extract_teams_link(event)
-        if not link:
-            log.info("  [%s в %s] нет Teams-ссылки в месте/теле — пропуск", subject, local_start.strftime("%H:%M"))
             continue
 
         duration = int((event.end - event.start).total_seconds() / 60) or 60
@@ -334,10 +408,10 @@ def check_calendar_and_dispatch(account: Account, processed_ids: set, pending_ve
         date_time = local_start.strftime("%d.%m.%Y - %H:%M")
         title = f"{subject} - {room} - ({date_time})" if room else f"{subject} - ({date_time})"
 
-        log.info("Найдена встреча к отправке: %s", title)
+        log.info("Найдена встреча к отправке (из календаря '%s'): %s", label, title)
 
         if send_to_fireflies(link, title, duration):
-            processed_ids.add(event_id)
+            processed_ids.add(meeting_key)
             save_state(processed_ids)
             pending_verifications.append({
                 "title": title,
@@ -351,8 +425,13 @@ def check_calendar_and_dispatch(account: Account, processed_ids: set, pending_ve
 
 def main() -> None:
     log.info("Подключение к Exchange (LanCloud), сервер: %s", EWS_SERVER)
-    account = connect_account()
-    log.info("Подключено. Мониторинг календаря запущен (опрос каждые %sс).", POLL_INTERVAL_SECONDS)
+    config = connect_and_verify()
+    calendar_accounts = build_calendar_accounts(config)
+    log.info(
+        "Подключено. Мониторинг %d календарей запущен (опрос каждые %sс): %s",
+        len(calendar_accounts), POLL_INTERVAL_SECONDS,
+        ", ".join(label for label, _ in calendar_accounts),
+    )
 
     processed_ids = load_state()
     pending_verifications: list = []
@@ -360,7 +439,7 @@ def main() -> None:
 
     while True:
         try:
-            check_calendar_and_dispatch(account, processed_ids, pending_verifications)
+            check_calendar_and_dispatch(calendar_accounts, processed_ids, pending_verifications)
             process_pending_verifications(pending_verifications, tz)
         except UnauthorizedError:
             log.error("Ошибка авторизации в Exchange — проверьте логин/пароль/сервер.")
